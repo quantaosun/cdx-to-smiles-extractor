@@ -1,0 +1,89 @@
+{
+  "results": [
+    {
+      "index": 1,
+      "file": "Aspirin.cdx",
+      "compound_id": "Aspirin",
+      "smiles": "CC(=O)Oc1ccccc1C(=O)O",
+      "stereo_note": "none",
+      "all_smiles": [
+        "CC(=O)Oc1ccccc1C(=O)O"
+      ],
+      "annotations": {
+        "CpdIndex": "Aspirin"
+      },
+      "text_labels": []
+    },
+    {
+      "index": 2,
+      "file": "Atorvastatin.cdx",
+      "compound_id": "Atorvastatin",
+      "smiles": "CC(C)c1c(C(=O)Nc2ccccc2F)c(-c2ccccc2)c(-c2ccc(F)cc2)n1CCC(O)CC(O)CC(=O)O",
+      "stereo_note": "unassigned",
+      "all_smiles": [
+        "CC(C)c1c(C(=O)Nc2ccccc2F)c(-c2ccccc2)c(-c2ccc(F)cc2)n1CCC(O)CC(O)CC(=O)O"
+      ],
+      "annotations": {
+        "CpdIndex": "Atorvastatin"
+      },
+      "text_labels": []
+    },
+    {
+      "index": 3,
+      "file": "Caffeine.cdx",
+      "compound_id": "Caffeine",
+      "smiles": "Cn1c(=O)c2c(ncn2C)n(C)c1=O",
+      "stereo_note": "none",
+      "all_smiles": [
+        "Cn1c(=O)c2c(ncn2C)n(C)c1=O"
+      ],
+      "annotations": {
+        "CpdIndex": "Caffeine"
+      },
+      "text_labels": []
+    },
+    {
+      "index": 4,
+      "file": "Ibuprofen.cdx",
+      "compound_id": "Ibuprofen",
+      "smiles": "CC(C)Cc1ccc(C(C)C(=O)O)cc1",
+      "stereo_note": "unassigned",
+      "all_smiles": [
+        "CC(C)Cc1ccc(C(C)C(=O)O)cc1"
+      ],
+      "annotations": {
+        "CpdIndex": "Ibuprofen"
+      },
+      "text_labels": []
+    },
+    {
+      "index": 5,
+      "file": "Metformin.cdx",
+      "compound_id": "Metformin",
+      "smiles": "CN(C)C(=N)NC(=N)N",
+      "stereo_note": "none",
+      "all_smiles": [
+        "CN(C)C(=N)NC(=N)N"
+      ],
+      "annotations": {
+        "CpdIndex": "Metformin"
+      },
+      "text_labels": []
+    },
+    {
+      "index": 6,
+      "file": "Paracetamol.cdx",
+      "compound_id": "Paracetamol",
+      "smiles": "CC(=O)Nc1ccc(O)cc1",
+      "stereo_note": "none",
+      "all_smiles": [
+        "CC(=O)Nc1ccc(O)cc1"
+      ],
+      "annotations": {
+        "CpdIndex": "Paracetamol"
+      },
+      "text_labels": []
+    }
+  ],
+  "failed": []
+}

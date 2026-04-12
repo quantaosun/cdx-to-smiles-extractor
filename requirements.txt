@@ -1,0 +1,13 @@
+# Core cheminformatics
+rdkit>=2023.03.1
+git+https://github.com/kienerj/pycdxml.git
+
+# OLE2 compound document parsing
+olefile>=0.46
+
+# Data handling and Excel export
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# PPTX generation (only needed for examples/generate_example_pptx.py)
+python-pptx>=0.6.21

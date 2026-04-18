@@ -54,9 +54,100 @@ def _natural_sort_key(s: str) -> list:
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
 
 
+def _row_band(y: int, band_size: int = 2_000_000) -> int:
+    """
+    Quantise a y-coordinate (in EMUs) into a row band.
+
+    Structures on the same visual row in a slide have very similar y-coordinates
+    but not identical ones (small alignment offsets). Quantising into bands of
+    ~2 mm (2 000 000 EMU ≈ 56 pt) groups them into the same row so that
+    left-to-right ordering within a row is applied correctly.
+    """
+    return (y // band_size) * band_size
+
+
+def _build_slide_position_map(pptx_path: str, extract_dir: str) -> dict[str, tuple[int, int, int]]:
+    """
+    Parse all slide XMLs and return a mapping of OLE filename → (slide_num, row_band, x).
+
+    This is used to sort extracted structures in the same visual order as they
+    appear in the presentation: slide by slide, top-to-bottom row, left-to-right
+    within each row.
+
+    Parameters
+    ----------
+    pptx_path : str
+        Path to the PPTX file (already extracted to extract_dir).
+    extract_dir : str
+        Directory where the PPTX was extracted.
+
+    Returns
+    -------
+    dict mapping ole_filename (e.g. 'oleObject3.bin') to (slide_num, row_band, x).
+    """
+    P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+    A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+    position_map = {}
+    base = Path(extract_dir)
+
+    try:
+        prs_root = ET.parse(str(base / 'ppt' / 'presentation.xml')).getroot()
+        prs_rels = ET.parse(str(base / 'ppt' / '_rels' / 'presentation.xml.rels')).getroot()
+        rid_to_target = {r.get('Id'): r.get('Target') for r in prs_rels}
+
+        slide_rids = [sl.get(f'{{{R}}}id') for sl in prs_root.iter(f'{{{P}}}sldId')]
+
+        for slide_num, rid in enumerate(slide_rids, 1):
+            target = rid_to_target.get(rid, '')
+            slide_file = target.lstrip('/').lstrip('../')
+            if not slide_file.startswith('ppt/'):
+                slide_file = 'ppt/' + slide_file
+            slide_path = base / slide_file
+            if not slide_path.exists():
+                continue
+
+            slide_root = ET.parse(str(slide_path)).getroot()
+            slide_name = slide_path.name
+            rels_path = base / 'ppt' / 'slides' / '_rels' / f'{slide_name}.rels'
+            if not rels_path.exists():
+                continue
+
+            rels_root = ET.parse(str(rels_path)).getroot()
+            rid_to_ole = {
+                r.get('Id'): Path(r.get('Target', '')).name
+                for r in rels_root
+                if 'oleObject' in r.get('Target', '')
+            }
+
+            for gf in slide_root.iter(f'{{{P}}}graphicFrame'):
+                ole_el = gf.find(f'.//{{{P}}}oleObj')
+                if ole_el is None:
+                    continue
+                frame_rid = ole_el.get(f'{{{R}}}id', '')
+                ole_name = rid_to_ole.get(frame_rid, '')
+                if not ole_name:
+                    continue
+                xfrm = gf.find(f'.//{{{A}}}xfrm')
+                off = xfrm.find(f'{{{A}}}off') if xfrm is not None else None
+                x = int(off.get('x', 0)) if off is not None else 0
+                y = int(off.get('y', 0)) if off is not None else 0
+                position_map[ole_name] = (slide_num, _row_band(y), x)
+
+    except Exception as e:
+        print(f"  [WARN] Could not build slide position map: {e}")
+
+    return position_map
+
+
 def _extract_pptx(pptx_path: str, extract_dir: str) -> list[Path]:
     """
-    Unzip a PPTX file and return a sorted list of OLE embedding paths.
+    Unzip a PPTX file and return OLE embedding paths sorted by visual slide order.
+
+    Ordering: slide number → top-to-bottom row band → left-to-right x position.
+    This matches the visual reading order of structures in the presentation.
+    Falls back to natural filename sort if position data is unavailable.
 
     Parameters
     ----------
@@ -68,7 +159,7 @@ def _extract_pptx(pptx_path: str, extract_dir: str) -> list[Path]:
     Returns
     -------
     list[Path]
-        Sorted list of paths to oleObjectX.bin files.
+        Position-sorted list of paths to oleObjectX.bin files.
     """
     with zipfile.ZipFile(pptx_path, 'r') as zf:
         zf.extractall(extract_dir)
@@ -77,11 +168,18 @@ def _extract_pptx(pptx_path: str, extract_dir: str) -> list[Path]:
     if not embeddings_dir.exists():
         return []
 
-    ole_files = sorted(
-        [f for f in os.listdir(embeddings_dir) if f.endswith('.bin')],
-        key=_natural_sort_key
-    )
-    return [embeddings_dir / f for f in ole_files]
+    ole_files = [f for f in os.listdir(embeddings_dir) if f.endswith('.bin')]
+
+    # Build slide-position map and sort by (slide, row_band, x)
+    position_map = _build_slide_position_map(pptx_path, extract_dir)
+
+    def _sort_key(fname: str):
+        if fname in position_map:
+            return position_map[fname]          # (slide_num, row_band, x)
+        return (9999, 9999, _natural_sort_key(fname)[0])  # unmapped: append at end
+
+    ole_files_sorted = sorted(ole_files, key=_sort_key)
+    return [embeddings_dir / f for f in ole_files_sorted]
 
 
 def _extract_cdx_from_ole(ole_path: Path) -> bytes | None:

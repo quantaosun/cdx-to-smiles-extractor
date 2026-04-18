@@ -197,8 +197,23 @@ def _extract_metadata(cdxml_str: str) -> dict:
     meta = {'compound_id': None, 'text_labels': [], 'annotations': {}}
     try:
         root = ET.fromstring(cdxml_str)
+        page = root.find('page')
+        if page is None:
+            page = root  # fallback: search whole document
 
-        for ann in root.iter('annotation'):
+        # KEY FIX: scope to the <group> that contains the molecule (<fragment>).
+        # Each CDX OLE object may carry loose page-level <annotation> tags that
+        # belong to a *neighbouring* compound drawn on the same slide cell.
+        # Scanning root.iter() picks those up and assigns the wrong ID.
+        # By restricting to the group that owns the fragment we guarantee a
+        # 1-to-1 mapping between structure and ID.
+        search_scope = page
+        groups_with_mol = [g for g in page.findall('group')
+                           if list(g.iter('fragment'))]
+        if groups_with_mol:
+            search_scope = groups_with_mol[0]
+
+        for ann in search_scope.iter('annotation'):
             kw = ann.get('Keyword', '')
             ct = ann.get('Content', '')
             if kw and ct:
@@ -206,7 +221,7 @@ def _extract_metadata(cdxml_str: str) -> dict:
                 if kw in ('CpdIndex', 'CompoundIndex') and not meta['compound_id']:
                     meta['compound_id'] = ct
 
-        for t in root.iter('t'):
+        for t in search_scope.iter('t'):
             for s in t.findall('s'):
                 if s.text and s.text.strip():
                     text = s.text.strip()

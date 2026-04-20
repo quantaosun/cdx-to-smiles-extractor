@@ -80,10 +80,15 @@ def build_dataframe(results: list[dict]) -> pd.DataFrame:
     for r in results:
         ann = r.get('annotations', {})
 
+        # Always trust the compound_id resolved by extract_cdx._extract_metadata
+        # first — it handles all three CDX layout variants correctly.
+        # The CpdIndex annotation is kept as metadata but must NOT override
+        # compound_id because in Layout C objects it contains a stale ID
+        # copied from a neighbouring compound in the source PPTX.
         compound_id = (
+            r.get('compound_id') or
             ann.get('CpdIndex') or
             ann.get('CompoundIndex') or
-            r.get('compound_id') or
             f"Unknown_{r['index']}"
         )
         if compound_id in ('N', ''):

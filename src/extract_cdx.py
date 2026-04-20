@@ -54,25 +54,49 @@ def _natural_sort_key(s: str) -> list:
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
 
 
-def _row_band(y: int, band_size: int = 2_000_000) -> int:
+def _gap_sort_slide(objects: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
     """
-    Quantise a y-coordinate (in EMUs) into a row band.
+    Sort (y, x, ole_name) tuples into visual reading order using gap-based row detection.
 
-    Structures on the same visual row in a slide have very similar y-coordinates
-    but not identical ones (small alignment offsets). Quantising into bands of
-    ~2 mm (2 000 000 EMU ≈ 56 pt) groups them into the same row so that
-    left-to-right ordering within a row is applied correctly.
+    Algorithm
+    ---------
+    1. Sort all objects by y-coordinate.
+    2. Identify row boundaries wherever the y-gap between consecutive objects
+       exceeds a threshold (90 pt = ~3 cm). This is robust to small misalignments
+       because real row gaps in a slide are always much larger than within-row
+       y-variation.
+    3. Within each detected row, sort left-to-right by x-coordinate.
+
+    This approach works correctly regardless of whether structures are perfectly
+    aligned on the slide grid.
     """
-    return (y // band_size) * band_size
+    if not objects:
+        return []
+    # 90 pt in EMU: 90 * 914400 / 72
+    ROW_GAP_THRESHOLD = int(90 * 914400 / 72)
+    by_y = sorted(objects, key=lambda t: t[0])
+    rows: list[list] = []
+    current_row = [by_y[0]]
+    for i in range(1, len(by_y)):
+        if by_y[i][0] - by_y[i - 1][0] > ROW_GAP_THRESHOLD:
+            rows.append(current_row)
+            current_row = [by_y[i]]
+        else:
+            current_row.append(by_y[i])
+    rows.append(current_row)
+    result = []
+    for row in rows:
+        result.extend(sorted(row, key=lambda t: t[1]))
+    return result
 
 
-def _build_slide_position_map(pptx_path: str, extract_dir: str) -> dict[str, tuple[int, int, int]]:
+def _build_slide_position_map(pptx_path: str, extract_dir: str) -> dict[str, tuple[int, int]]:
     """
-    Parse all slide XMLs and return a mapping of OLE filename → (slide_num, row_band, x).
+    Parse all slide XMLs and return a mapping of OLE filename → (global_rank,).
 
-    This is used to sort extracted structures in the same visual order as they
-    appear in the presentation: slide by slide, top-to-bottom row, left-to-right
-    within each row.
+    Structures are ranked in visual reading order: slide by slide, then
+    top-to-bottom row (detected by y-gap), then left-to-right within each row.
+    The rank is a single integer used as the sort key in _extract_pptx.
 
     Parameters
     ----------
@@ -83,23 +107,23 @@ def _build_slide_position_map(pptx_path: str, extract_dir: str) -> dict[str, tup
 
     Returns
     -------
-    dict mapping ole_filename (e.g. 'oleObject3.bin') to (slide_num, row_band, x).
+    dict mapping ole_filename → integer rank (0-based, lower = earlier).
     """
     P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
     A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
     R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
-    position_map = {}
+    rank_map: dict[str, int] = {}
     base = Path(extract_dir)
+    global_rank = 0
 
     try:
         prs_root = ET.parse(str(base / 'ppt' / 'presentation.xml')).getroot()
         prs_rels = ET.parse(str(base / 'ppt' / '_rels' / 'presentation.xml.rels')).getroot()
         rid_to_target = {r.get('Id'): r.get('Target') for r in prs_rels}
-
         slide_rids = [sl.get(f'{{{R}}}id') for sl in prs_root.iter(f'{{{P}}}sldId')]
 
-        for slide_num, rid in enumerate(slide_rids, 1):
+        for rid in slide_rids:
             target = rid_to_target.get(rid, '')
             slide_file = target.lstrip('/').lstrip('../')
             if not slide_file.startswith('ppt/'):
@@ -121,6 +145,8 @@ def _build_slide_position_map(pptx_path: str, extract_dir: str) -> dict[str, tup
                 if 'oleObject' in r.get('Target', '')
             }
 
+            # Collect (y, x, ole_name) for every OLE on this slide
+            slide_objects: list[tuple[int, int, str]] = []
             for gf in slide_root.iter(f'{{{P}}}graphicFrame'):
                 ole_el = gf.find(f'.//{{{P}}}oleObj')
                 if ole_el is None:
@@ -133,12 +159,17 @@ def _build_slide_position_map(pptx_path: str, extract_dir: str) -> dict[str, tup
                 off = xfrm.find(f'{{{A}}}off') if xfrm is not None else None
                 x = int(off.get('x', 0)) if off is not None else 0
                 y = int(off.get('y', 0)) if off is not None else 0
-                position_map[ole_name] = (slide_num, _row_band(y), x)
+                slide_objects.append((y, x, ole_name))
+
+            # Sort this slide's objects into visual reading order
+            for _, _, ole_name in _gap_sort_slide(slide_objects):
+                rank_map[ole_name] = global_rank
+                global_rank += 1
 
     except Exception as e:
         print(f"  [WARN] Could not build slide position map: {e}")
 
-    return position_map
+    return rank_map
 
 
 def _extract_pptx(pptx_path: str, extract_dir: str) -> list[Path]:
@@ -170,13 +201,12 @@ def _extract_pptx(pptx_path: str, extract_dir: str) -> list[Path]:
 
     ole_files = [f for f in os.listdir(embeddings_dir) if f.endswith('.bin')]
 
-    # Build slide-position map and sort by (slide, row_band, x)
-    position_map = _build_slide_position_map(pptx_path, extract_dir)
+    # Build slide-position rank map (visual reading order)
+    rank_map = _build_slide_position_map(pptx_path, extract_dir)
 
     def _sort_key(fname: str):
-        if fname in position_map:
-            return position_map[fname]          # (slide_num, row_band, x)
-        return (9999, 9999, _natural_sort_key(fname)[0])  # unmapped: append at end
+        # rank_map values are integers; unmapped files go to the end
+        return rank_map.get(fname, 999999)
 
     ole_files_sorted = sorted(ole_files, key=_sort_key)
     return [embeddings_dir / f for f in ole_files_sorted]
@@ -299,37 +329,118 @@ def _extract_metadata(cdxml_str: str) -> dict:
         if page is None:
             page = root  # fallback: search whole document
 
-        # KEY FIX: scope to the <group> that contains the molecule (<fragment>).
-        # Each CDX OLE object may carry loose page-level <annotation> tags that
-        # belong to a *neighbouring* compound drawn on the same slide cell.
-        # Scanning root.iter() picks those up and assigns the wrong ID.
-        # By restricting to the group that owns the fragment we guarantee a
-        # 1-to-1 mapping between structure and ID.
-        search_scope = page
+        # ------------------------------------------------------------------ #
+        # ChemDraw CDX objects are found in three structural layouts:
+        #
+        # Layout A — group-wrapped (older ChemDraw / copy-paste):
+        #   <page>
+        #     <group>                ← owns BOTH molecule and metadata
+        #       <fragment/>          ← the molecule
+        #       <annotation Keyword="CpdIndex" Content="CORRECT-ID"/>
+        #       <t><s>CORRECT-ID</s></t>
+        #     </group>
+        #     <annotation Content="FOREIGN-ID"/>  ← belongs to neighbour
+        #   </page>
+        #   Fix: scope to the group that directly contains <fragment>.
+        #
+        # Layout B — group-separated (newer DEL exports, group has no fragment):
+        #   <page>
+        #     <fragment/>            ← molecule is a direct page child
+        #     <group>                ← metadata group (no fragment inside)
+        #       <annotation Keyword="CpdIndex" Content="CORRECT-ID"/>
+        #       <t><s>CORRECT-ID</s></t>
+        #     </group>
+        #     <annotation Content="STALE-ID"/>  ← stale/wrong, ignore
+        #   </page>
+        #   Fix: use the non-fragment group; ignore page-level annotations.
+        #
+        # Layout C — flat (newer DEL exports, no metadata group):
+        #   <page>
+        #     <fragment/>            ← molecule is a direct page child
+        #     <t><s>CORRECT-ID</s></t>  ← ID is a direct page-level <t>
+        #     <annotation Content="STALE-ID"/>  ← stale/wrong, ignore
+        #   </page>
+        #   Fix: use the page-level <t> text; ignore page-level annotations.
+        #
+        # Detection order:
+        #   1. If any <group> directly contains a <fragment>  → Layout A
+        #   2. Else if any <group> (without fragment) exists  → Layout B
+        #   3. Else                                           → Layout C
+        # ------------------------------------------------------------------ #
+
         groups_with_mol = [g for g in page.findall('group')
-                           if list(g.iter('fragment'))]
+                           if g.find('fragment') is not None]
+        groups_without_mol = [g for g in page.findall('group')
+                               if g.find('fragment') is None]
+
         if groups_with_mol:
-            search_scope = groups_with_mol[0]
+            # Layout A: the group owns both the molecule and its metadata.
+            # Page-level annotations belong to neighbouring compounds.
+            # IMPORTANT: text labels inside the group are atom labels (O, NH,
+            # F, etc.) drawn on the structure — NOT the compound ID.
+            # Use the CpdIndex annotation as the primary ID source.
+            ann_scope = groups_with_mol[0]
+            for ann in ann_scope.iter('annotation'):
+                kw = ann.get('Keyword', '')
+                ct = ann.get('Content', '')
+                if kw and ct:
+                    meta['annotations'][kw] = ct
+            # Collect text labels too (for metadata), but do NOT use them as ID
+            for t in ann_scope.iter('t'):
+                for s in t.findall('s'):
+                    if s.text and s.text.strip():
+                        meta['text_labels'].append(s.text.strip())
+            # ID: prefer CpdIndex annotation
+            for kw in ('CpdIndex', 'CompoundIndex'):
+                if kw in meta['annotations']:
+                    meta['compound_id'] = meta['annotations'][kw]
+                    break
 
-        for ann in search_scope.iter('annotation'):
-            kw = ann.get('Keyword', '')
-            ct = ann.get('Content', '')
-            if kw and ct:
-                meta['annotations'][kw] = ct
-                if kw in ('CpdIndex', 'CompoundIndex') and not meta['compound_id']:
-                    meta['compound_id'] = ct
-
-        for t in search_scope.iter('t'):
-            for s in t.findall('s'):
-                if s.text and s.text.strip():
-                    text = s.text.strip()
-                    if not meta['compound_id'] and '\n' not in text:
+        elif groups_without_mol:
+            # Layout B: metadata lives in a sibling group (no fragment).
+            # The group's <t> text label is the compound ID.
+            # Page-level annotations are stale — ignore them.
+            ann_scope = groups_without_mol[0]
+            for ann in ann_scope.iter('annotation'):
+                kw = ann.get('Keyword', '')
+                ct = ann.get('Content', '')
+                if kw and ct:
+                    meta['annotations'][kw] = ct
+            for t in ann_scope.iter('t'):
+                for s in t.findall('s'):
+                    if s.text and s.text.strip():
+                        meta['text_labels'].append(s.text.strip())
+            # ID: prefer CpdIndex annotation, then first short text label
+            for kw in ('CpdIndex', 'CompoundIndex'):
+                if kw in meta['annotations']:
+                    meta['compound_id'] = meta['annotations'][kw]
+                    break
+            if not meta['compound_id']:
+                for text in meta['text_labels']:
+                    if '\n' not in text:
                         meta['compound_id'] = text
-                    meta['text_labels'].append(text)
+                        break
 
-        # Last resort: first line of first text label
-        if not meta['compound_id'] and meta['text_labels']:
-            meta['compound_id'] = meta['text_labels'][0].split('\n')[0].strip()
+        else:
+            # Layout C: flat — fragment is a direct page child, no groups.
+            # The compound ID is in a direct page-level <t> text element.
+            # Page-level CpdIndex annotations are stale (copied from neighbour).
+            # Collect annotations as metadata only (not for ID).
+            for ann in page.findall('annotation'):
+                kw = ann.get('Keyword', '')
+                ct = ann.get('Content', '')
+                if kw and ct:
+                    meta['annotations'][kw] = ct
+            # Direct page-level <t> elements hold the compound ID
+            for t in page.findall('t'):
+                for s in t.findall('s'):
+                    if s.text and s.text.strip():
+                        meta['text_labels'].append(s.text.strip())
+            # ID: first short single-line direct page text
+            for text in meta['text_labels']:
+                if '\n' not in text:
+                    meta['compound_id'] = text
+                    break
 
     except Exception as e:
         print(f"  [WARN] Metadata extraction: {e}")

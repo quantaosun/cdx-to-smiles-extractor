@@ -21,7 +21,7 @@ import re
 import csv
 import glob
 import logging
-import tempfile
+
 import argparse
 from pathlib import Path
 

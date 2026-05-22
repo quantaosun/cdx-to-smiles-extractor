@@ -20,6 +20,8 @@ import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+from extract_cdx import _ID_ANNOTATION_KEYS
+
 
 # ── Styling constants ─────────────────────────────────────────────────────────
 
@@ -54,17 +56,58 @@ def load_results(json_path: str) -> list[dict]:
         return json.load(f)['results']
 
 
+def _normalise_annotation_keys(annotations: dict) -> dict:
+    """
+    Normalise annotation keys so that different naming conventions used by
+    different ChemDraw CDX export versions are unified under one name.
+
+    Specifically, ``SeqCount_*`` keys (produced by some DEL export templates)
+    are renamed to ``SequenceCount_*`` to match the canonical column name.
+    This prevents the same data from appearing in two separate columns when
+    rows from different CDX layout variants are combined in one spreadsheet.
+
+    Examples
+    --------
+    ``SeqCount_S1_1h``  → ``SequenceCount_S1_1h``
+    ``SeqCount_S01``    → ``SequenceCount_S01``
+    """
+    normalised: dict = {}
+    for k, v in annotations.items():
+        if k.startswith('SeqCount_'):
+            new_key = 'SequenceCount_' + k[len('SeqCount_'):]
+        else:
+            new_key = k
+        # If the canonical key already exists (shouldn't happen, but be safe),
+        # prefer the non-empty value.
+        if new_key in normalised:
+            normalised[new_key] = normalised[new_key] or v
+        else:
+            normalised[new_key] = v
+    return normalised
+
+
 def build_dataframe(results: list[dict]) -> pd.DataFrame:
     """
     Flatten the nested JSON result list into a pandas DataFrame.
 
     Mandatory columns: Compound_ID, SMILES
     Optional columns:  MW, CLogP, all annotation keys, Source_File
+
+    Annotation keys are normalised before building the DataFrame so that
+    ``SeqCount_*`` and ``SequenceCount_*`` variants are merged into a single
+    ``SequenceCount_*`` column.
     """
-    # Discover all annotation keys across all records
+    # Normalise annotation keys in-place for all records
+    for r in results:
+        if 'annotations' in r:
+            r['annotations'] = _normalise_annotation_keys(r['annotations'])
+
+    # Discover all annotation keys across all records, preserving the
+    # first-seen insertion order — this matches the top-to-bottom order
+    # of annotations in the source CDX objects, which becomes left-to-right
+    # in the Excel output.
     all_ann_keys: list[str] = []
     seen: set[str] = set()
-    priority_keys = ['MW', 'Molecular_Weight', 'CLogP', 'ALogP']
 
     for r in results:
         for k in r.get('annotations', {}):
@@ -72,25 +115,23 @@ def build_dataframe(results: list[dict]) -> pd.DataFrame:
                 seen.add(k)
                 all_ann_keys.append(k)
 
-    # Put priority keys first, then the rest alphabetically
-    ordered_keys = [k for k in priority_keys if k in seen] + \
-                   sorted(k for k in all_ann_keys if k not in priority_keys)
-
+    # Preserve CDX insertion order for all annotation columns.
+    # No alphabetical sort — the order reflects the original CDX annotation
+    # sequence, which is meaningful (e.g. MW, CLogP, SeqCounts in assay order).
     rows = []
     for r in results:
         ann = r.get('annotations', {})
 
-        # Always trust the compound_id resolved by extract_cdx._extract_metadata
-        # first — it handles all three CDX layout variants correctly.
-        # The CpdIndex annotation is kept as metadata but must NOT override
-        # compound_id because in Layout C objects it contains a stale ID
-        # copied from a neighbouring compound in the source PPTX.
-        compound_id = (
-            r.get('compound_id') or
-            ann.get('CpdIndex') or
-            ann.get('CompoundIndex') or
-            f"Unknown_{r['index']}"
-        )
+        # compound_id from extract_cdx is authoritative (handles all CDX layouts).
+        # Annotation-key fallback is a safety net for hand-edited JSON.
+        compound_id = r.get('compound_id')
+        if not compound_id:
+            for kw in _ID_ANNOTATION_KEYS:
+                compound_id = ann.get(kw)
+                if compound_id:
+                    break
+        if not compound_id:
+            compound_id = f"Unknown_{r['index']}"
         if compound_id in ('N', ''):
             compound_id = f"Unknown_{r['index']}"
 
@@ -99,7 +140,7 @@ def build_dataframe(results: list[dict]) -> pd.DataFrame:
             'SMILES':      r.get('smiles', ''),
             'Stereo_Note': r.get('stereo_note', ''),
         }
-        for k in ordered_keys:
+        for k in all_ann_keys:
             row[k] = ann.get(k, '')
         row['Source_File'] = r.get('file', '')
 

@@ -49,10 +49,6 @@ except ImportError as e:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _natural_sort_key(s: str) -> list:
-    """Sort key for natural ordering of filenames (e.g. ole1 < ole2 < ole10)."""
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
-
 
 def _gap_sort_slide(objects: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
     """
@@ -232,6 +228,9 @@ def _extract_cdx_from_ole(ole_path: Path) -> bytes | None:
         ole = olefile.OleFileIO(str(ole_path))
         if ole.exists('CONTENTS'):
             data = ole.openstream('CONTENTS').read()
+            if data[:8] != _CDX_MAGIC:
+                print(f"  [WARN] Unexpected magic bytes ({data[:8].hex()}) in {ole_path.name}; skipping.")
+                return None
             return data
     except Exception as e:
         print(f"  [ERROR] Reading OLE {ole_path.name}: {e}")
@@ -374,27 +373,53 @@ def _extract_metadata(cdxml_str: str) -> dict:
                                if g.find('fragment') is None]
 
         if groups_with_mol:
-            # Layout A: the group owns both the molecule and its metadata.
-            # Page-level annotations belong to neighbouring compounds.
+            # Layout A: the group owns the molecule.
+            # Metadata annotations are normally inside the group, but in some
+            # CDX variants (Layout A2) the group has no annotations and all
+            # metadata sits at page level instead.
+            # Page-level annotations that belong to a *neighbour* compound are
+            # a known issue in other layouts — but in Layout A2 the page-level
+            # annotations are the ONLY source of metadata, so we must use them
+            # when the group itself is empty.
             # IMPORTANT: text labels inside the group are atom labels (O, NH,
             # F, etc.) drawn on the structure — NOT the compound ID.
             # Use the CpdIndex annotation as the primary ID source.
             ann_scope = groups_with_mol[0]
-            for ann in ann_scope.iter('annotation'):
-                kw = ann.get('Keyword', '')
-                ct = ann.get('Content', '')
-                if kw and ct:
-                    meta['annotations'][kw] = ct
-            # Collect text labels too (for metadata), but do NOT use them as ID
+            group_anns = list(ann_scope.iter('annotation'))
+            if group_anns:
+                # Layout A (classic): annotations are inside the group
+                for ann in group_anns:
+                    kw = ann.get('Keyword', '')
+                    ct = ann.get('Content', '')
+                    if kw and ct:
+                        meta['annotations'][kw] = ct
+            else:
+                # Layout A2: group has no annotations.
+                # Page-level annotations are STALE (copied from a neighbour) —
+                # do NOT use them for ID or metadata.
+                # The true compound ID is embedded as a <t> text element inside
+                # the group, mixed with atom labels (O, N, S, etc.).
+                # We identify it by looking for a text that matches the compound
+                # ID pattern (hyphenated alphanumeric, e.g. PAC-DEL1726-525-3492).
+                pass
             for t in ann_scope.iter('t'):
                 for s in t.findall('s'):
                     if s.text and s.text.strip():
                         meta['text_labels'].append(s.text.strip())
-            # ID: prefer CpdIndex annotation
-            for kw in ('CpdIndex', 'CompoundIndex'):
+            # ID: for Layout A (classic) prefer CpdIndex annotation;
+            #     for Layout A2 the annotation dict is empty, so fall through
+            #     to the text-label search below.
+            for kw in _ID_ANNOTATION_KEYS:
                 if kw in meta['annotations']:
                     meta['compound_id'] = meta['annotations'][kw]
                     break
+            # Layout A2 fallback: find the compound-ID-like text label.
+            if not meta['compound_id']:
+                for text in meta['text_labels']:
+                    first_line = text.split('\n')[0].strip()
+                    if _ID_PAT.match(first_line) and len(first_line) > _MIN_COMPOUND_ID_LENGTH:
+                        meta['compound_id'] = first_line
+                        break
 
         elif groups_without_mol:
             # Layout B: metadata lives in a sibling group (no fragment).
@@ -411,7 +436,7 @@ def _extract_metadata(cdxml_str: str) -> dict:
                     if s.text and s.text.strip():
                         meta['text_labels'].append(s.text.strip())
             # ID: prefer CpdIndex annotation, then first short text label
-            for kw in ('CpdIndex', 'CompoundIndex'):
+            for kw in _ID_ANNOTATION_KEYS:
                 if kw in meta['annotations']:
                     meta['compound_id'] = meta['annotations'][kw]
                     break
@@ -424,13 +449,10 @@ def _extract_metadata(cdxml_str: str) -> dict:
         else:
             # Layout C: flat — fragment is a direct page child, no groups.
             # The compound ID is in a direct page-level <t> text element.
-            # Page-level CpdIndex annotations are stale (copied from neighbour).
-            # Collect annotations as metadata only (not for ID).
-            for ann in page.findall('annotation'):
-                kw = ann.get('Keyword', '')
-                ct = ann.get('Content', '')
-                if kw and ct:
-                    meta['annotations'][kw] = ct
+            # Page-level annotations are STALE (copied from a neighbouring
+            # compound in the source PPTX) — do NOT collect them as metadata.
+            # Collecting them would fabricate SequenceCount/MW/CLogP values
+            # for compounds that don't own those annotations.
             # Direct page-level <t> elements hold the compound ID
             for t in page.findall('t'):
                 for s in t.findall('s'):
@@ -463,7 +485,7 @@ def _stereo_note(smiles: str | None) -> str:
     if not smiles:
         return 'none'
     has_tet = '@' in smiles
-    has_dbl = '/' in smiles or chr(92) in smiles
+    has_dbl = '/' in smiles or '\\' in smiles
     if has_tet and has_dbl:
         return 'defined + E/Z'
     if has_tet:
@@ -481,6 +503,140 @@ def _stereo_note(smiles: str | None) -> str:
     except Exception:
         pass
     return 'none'
+
+
+# ── Multi-entry CDX handling (R-group tables / multi-group schemes) ────────────
+
+_ID_PAT = re.compile(r'^[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]')
+_ID_ANNOTATION_KEYS = ('CpdIndex', 'CompoundIndex', 'HitIndex')
+_MIN_COMPOUND_ID_LENGTH = 8
+_CDX_MAGIC = b'VjCD0100'
+
+
+def _is_multi_entry(text_labels: list[str]) -> bool:
+    """Check whether text_labels contain multiple compound IDs (R-group table)."""
+    count = sum(1 for t in text_labels
+                if _ID_PAT.match(t.split('\n')[0].strip())
+                and len(t.split('\n')[0].strip()) > _MIN_COMPOUND_ID_LENGTH)
+    return count >= 2
+
+
+def _expand_multi_entries(text_labels: list[str]) -> list[dict]:
+    """Parse alternating [ID, props, ID, props, ...] text labels into per-variant dicts."""
+    entries: list[dict] = []
+    i = 0
+    while i < len(text_labels):
+        first_line = text_labels[i].split('\n')[0].strip()
+        if _ID_PAT.match(first_line) and len(first_line) > _MIN_COMPOUND_ID_LENGTH:
+            entry = {'compound_id': first_line, 'annotations': {}, 'text_labels': text_labels}
+            if i + 1 < len(text_labels) and '\n' in text_labels[i + 1]:
+                for line in text_labels[i + 1].split('\n'):
+                    line = line.strip()
+                    if ':' in line:
+                        k, v = line.split(':', 1)
+                        entry['annotations'][k.strip()] = v.strip()
+            entries.append(entry)
+            i += 2
+        else:
+            i += 1
+    return entries
+
+
+def _parse_scope(scope) -> dict | None:
+    """Extract annotations, text labels, and compound ID from a CDXML scope element."""
+    annotations = {}
+    text_labels = []
+    for ann in scope.iter('annotation'):
+        kw = ann.get('Keyword', '')
+        ct = ann.get('Content', '')
+        if kw and ct:
+            annotations[kw] = ct
+    for t in scope.iter('t'):
+        for s in t.findall('s'):
+            if s.text and s.text.strip():
+                text_labels.append(s.text.strip())
+    cid = None
+    for kw in _ID_ANNOTATION_KEYS:
+        if kw in annotations:
+            cid = annotations[kw]
+            break
+    if not cid:
+        for text in text_labels:
+            fl = text.split('\n')[0].strip()
+            if _ID_PAT.match(fl) and len(fl) > _MIN_COMPOUND_ID_LENGTH:
+                cid = fl
+                break
+    if not cid:
+        for text in text_labels:
+            if '\n' not in text:
+                cid = text
+                break
+    if cid or annotations or text_labels:
+        return {'compound_id': cid, 'annotations': annotations, 'text_labels': text_labels}
+    return None
+
+
+def _extract_all_cdxml_entries(cdxml_str: str) -> list[dict]:
+    """Scan the entire CDXML for ALL compound entries across ALL groups.
+
+    Unlike ``_extract_metadata`` which returns the first compound found, this
+    function iterates every group (with or without fragments) and returns one
+    dict per compound.  This catches multi-group CDX objects where each group
+    is an individual R-group variant with its own HitIndex annotation.
+
+    Falls back to text-label alternating-pattern parsing for R-group tables
+    stored inside a single group.
+    """
+    entries: list[dict] = []
+    try:
+        root = ET.fromstring(cdxml_str)
+        page = root.find('page')
+        if page is None:
+            page = root
+
+        # ── Groups that contain a fragment (Layout A, possibly multi-group) ──
+        groups_with_mol = [g for g in page.findall('group')
+                           if g.find('fragment') is not None]
+        for group in groups_with_mol:
+            entry = _parse_scope(group)
+            if entry:
+                entries.append(entry)
+
+        # ── Groups without a fragment (Layout B metadata groups) ────────────
+        groups_without_mol = [g for g in page.findall('group')
+                              if g.find('fragment') is None]
+        if not groups_with_mol:
+            for group in groups_without_mol:
+                entry = _parse_scope(group)
+                if entry:
+                    entries.append(entry)
+        else:
+            # When groups-with-mol exist, also collect groups-without-mol that
+            # carry distinct compound IDs not already seen (some schemes mix both).
+            for group in groups_without_mol:
+                entry = _parse_scope(group)
+                if entry and entry.get('compound_id'):
+                    existing = {e.get('compound_id') for e in entries}
+                    if entry['compound_id'] not in existing:
+                        entries.append(entry)
+
+        # ── Fallback: page-level extraction (Layout C, no groups) ───────────
+        if not entries:
+            entry = _parse_scope(page)
+            if entry:
+                entries.append(entry)
+
+        # ── Last resort: expand via alternating text-label pattern ──────────
+        if len(entries) == 1 and entries[0].get('text_labels'):
+            tl = entries[0]['text_labels']
+            multi = _expand_multi_entries(tl) if _is_multi_entry(tl) else []
+            if len(multi) > 1:
+                return multi
+
+    except Exception as e:
+        print(f"  [WARN] Multi-entry extraction: {e}")
+
+    return entries
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -524,12 +680,6 @@ def process_pptx(pptx_path: str, output_json: str) -> list[dict]:
                 failed.append({'file': fname, 'reason': 'CDX extraction failed'})
                 continue
 
-            # Sanity check: CDX magic bytes
-            if cdx_data[:8] != b'VjCD0100':
-                print(f"  [WARN] Unexpected magic bytes ({cdx_data[:8].hex()}); skipping.")
-                failed.append({'file': fname, 'reason': 'Not a CDX file'})
-                continue
-
             # Step 2 — CDX → CDXML
             tmp_cdx = os.path.join(temp_dir, f'tmp_{i}.cdx')
             cdxml_str = _cdx_to_cdxml(cdx_data, tmp_cdx)
@@ -537,10 +687,7 @@ def process_pptx(pptx_path: str, output_json: str) -> list[dict]:
                 failed.append({'file': fname, 'reason': 'CDX → CDXML failed'})
                 continue
 
-            # Step 3 — Extract metadata
-            meta = _extract_metadata(cdxml_str)
-
-            # Step 4 — CDXML → SMILES
+            # Step 3 — CDXML → SMILES
             smiles_list = _cdxml_to_smiles(cdxml_str)
             smiles = smiles_list[0] if smiles_list else None
 
@@ -549,27 +696,48 @@ def process_pptx(pptx_path: str, output_json: str) -> list[dict]:
             if len(smiles_list) > 1:
                 print(f"  [INFO] {len(smiles_list)} molecules found; using first.")
 
-            compound_id = meta['compound_id'] or f'Unknown_{i}'
-            if compound_id in ('N', ''):
-                compound_id = f'Unknown_{i}'
-
-            # Step 5 — Annotate stereo status
             stereo_note = _stereo_note(smiles)
 
-            print(f"  ID:     {compound_id}")
-            print(f"  SMILES: {smiles}")
-            print(f"  Stereo: {stereo_note}")
+            # ── Build result row(s) ──────────────────────────────────────────
+            # Check for multi-compound CDX: multiple groups or R-group tables
+            all_entries = _extract_all_cdxml_entries(cdxml_str)
 
-            results.append({
-                'index':       i,
-                'file':        fname,
-                'compound_id': compound_id,
-                'smiles':      smiles,
-                'stereo_note': stereo_note,
-                'all_smiles':  smiles_list,
-                'annotations': meta['annotations'],
-                'text_labels': meta['text_labels'],
-            })
+            if len(all_entries) > 1:
+                print(f"  [MULTI] {len(all_entries)} compound variants in one CDX")
+                print(f"  SMILES: {smiles}")
+                print(f"  Stereo: {stereo_note}")
+                for entry in all_entries:
+                    results.append({
+                        'index':       len(results) + 1,
+                        'file':        fname,
+                        'compound_id': entry['compound_id'] or f'Unknown_{len(results) + 1}',
+                        'smiles':      smiles,
+                        'stereo_note': stereo_note,
+                        'all_smiles':  smiles_list,
+                        'annotations': entry.get('annotations', {}),
+                        'text_labels': entry.get('text_labels', []),
+                    })
+            else:
+                # Single entry — original logic (via _extract_metadata for compat)
+                meta = all_entries[0] if all_entries else _extract_metadata(cdxml_str)
+                compound_id = meta.get('compound_id') or f'Unknown_{i}'
+                if compound_id in ('N', ''):
+                    compound_id = f'Unknown_{i}'
+
+                print(f"  ID:     {compound_id}")
+                print(f"  SMILES: {smiles}")
+                print(f"  Stereo: {stereo_note}")
+
+                results.append({
+                    'index':       i,
+                    'file':        fname,
+                    'compound_id': compound_id,
+                    'smiles':      smiles,
+                    'stereo_note': stereo_note,
+                    'all_smiles':  smiles_list,
+                    'annotations': meta['annotations'],
+                    'text_labels': meta['text_labels'],
+                })
 
         # ── Summary ──────────────────────────────────────────────────────────
         print(f"\n{'─'*60}")
